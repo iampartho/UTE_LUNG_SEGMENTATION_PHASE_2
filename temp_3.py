@@ -1,216 +1,179 @@
+"""
+temp_3.py
+
+Loads a .npy scan, builds the 6-vertex orthogonal cross-polytopal hull
+(3 orthogonal directions x +/- perturbation, same method as
+compute_local_complexity_unet.py), and saves:
+  - the mid-coronal PNG of the original (normalised) scan
+  - the mid-coronal PNG for each of the 6 hull vertices
+  - optionally a NIfTI for each as well (SAVE_NIFTI flag)
+
+Coronal axis convention: dimension 1 (H axis) of the (D, H, W) volume.
+"""
+
 import os
-import ast
-import math
 import numpy as np
-import pandas as pd
-from scipy.fftpack import fftn
 import torch
-import torch.nn.functional as F
-import torch.nn as nn
-import SimpleITK as sitk
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import SimpleITK as sitk
+from torchvision import transforms
 
-# ===================== CONFIGURATION =====================
+from eval_step_1 import (
+    normalise_one_one, normalise_zero_one, normalise_hu,
+    VariableSpatialFix, ToTensor,
+)
 
-NPY_PATH = '/Shared/lss_segerard/parthghosh/data/COPDgene_CT_1.25mm_numpy/13370C_TLC.npy'
-CSV_PATH = './log/augmentation_weights_log_causality_train_td1_roughness_enforced.csv'
-OUTPUT_DIR = './generated_combinations'
-SPACING = (1.25, 1.25, 1.25)
-ROUGHNESS_THRESHOLD = 0.7
+# =====================================================================
+#  CONFIGURATION
+# =====================================================================
 
-DESIRED_COMBOS = [
-    'H-H-H-H', 'H-H-H-L', 'H-H-L-H', 'H-H-L-L', 'H-L-H-H', 'H-L-H-L', 'H-L-L-H', 'H-L-L-L', 'L-H-H-H', 'L-H-H-L', 'L-H-L-H', 'L-H-L-L', 'L-L-H-H', 'L-L-H-L', 'L-L-L-H', 'L-L-L-L'
-]
+NPY_PATH   = "/Shared/lss_segerard/parthghosh/data/UTE_new_data_numpy/103-035/20180424/AnatCorrLungs.npy"
+SCAN_TYPE  = "UTE"          # "UTE" or "CT"
 
-LAYER_SHAPES = [
-    (4, 1),   # Layer 0: out=interm(4), in=1
-    (4, 4),   # Layer 1: out=4,         in=4
-    (4, 4),   # Layer 2: out=4,         in=4
-    (1, 4),   # Layer 3: out=1,         in=4
-]
+OUTPUT_DIR = "./hull_slices"
+SPACING    = (1.25, 1.25, 1.25)
 
-# ===================== HELPERS =====================
+RADIUS     = 0.005          # cross-polytope radius (same as compute_local_complexity_unet.py)
+N_HULL     = 6              # must be even; gives N_HULL/2 = 3 orthogonal directions
+HULL_SEED  = 42
 
-def compute_roughness(weights_flat, kernel_size, out_ch, in_ch):
-    if kernel_size < 2:
-        return 0.0
-    k = kernel_size
-    w = np.array(weights_flat).reshape(out_ch, in_ch, k, k, k)
-    w_spatial = np.mean(w, axis=(0, 1))
-    fft_vals = np.abs(fftn(w_spatial))
-    total_energy = np.sum(fft_vals)
-    low_freq_energy = fft_vals[0, 0, 0]
-    return 1.0 - (low_freq_energy / (total_energy + 1e-9))
+SAVE_NIFTI = False          # also save .nii.gz for each volume
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-def classify(roughness):
-    return 'H' if roughness >= ROUGHNESS_THRESHOLD else 'L'
+# =====================================================================
+#  HELPERS
+# =====================================================================
 
-
-def row_combo(row):
-    labels = []
-    for i in range(4):
-        k = int(row[f'kernel_size_{i}'])
-        weights = ast.literal_eval(row[f'kernel_{i}'])
-        out_ch, in_ch = LAYER_SHAPES[i]
-        r = compute_roughness(weights, k, out_ch, in_ch)
-        labels.append(classify(r))
-    return '-'.join(labels)
+def _normalise(img: np.ndarray, scan_type: str) -> np.ndarray:
+    if scan_type == "UTE":
+        return normalise_one_one(img)
+    else:
+        return normalise_one_one(normalise_hu(img))
 
 
-def normalise_zero_one(image):
-    mn, mx = image.min(), image.max()
-    if mx > mn:
-        return (image - mn) / (mx - mn)
-    return image * 0.0
-
-
-def normalise_one_one(image):
-    return normalise_zero_one(image) * 2.0 - 1.0
-
-
-def generate_nifty(arr_np, spacing, output_path):
-    nifty = sitk.GetImageFromArray(arr_np)
-    nifty.SetSpacing(spacing)
-    sitk.WriteImage(nifty, output_path)
-
-
-def save_mid_coronal_png(volume, output_path):
+def save_mid_coronal_png(volume: np.ndarray, output_path: str, title: str = ""):
+    """Save the mid-coronal slice of a (D, H, W) volume as a PNG."""
     mid = volume.shape[1] // 2
     sl = volume[:, mid, :]
     sl = np.rot90(sl.T, k=3)
-    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-    ax.imshow(sl, cmap='gray', origin='lower')
-    ax.axis('off')
-    fig.savefig(output_path, bbox_inches='tight', pad_inches=0, dpi=150)
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.imshow(sl, cmap="gray", origin="lower")
+    if title:
+        ax.set_title(title, fontsize=10)
+    ax.axis("off")
+    fig.savefig(output_path, bbox_inches="tight", pad_inches=0, dpi=150)
     plt.close(fig)
 
 
-# ===================== GIN REPLAY =====================
-
-def replay_gin_layer(x_in, ker, k, use_act=True):
-    """Replay a single GradlessGCReplayNonlinBlock3D forward pass."""
-    nb, nc, nx, ny, nz = x_in.shape
-    out_ch = ker.shape[0] // nb
-
-    shift = torch.randn([out_ch * nb, 1, 1, 1], device=x_in.device)
-
-    x = x_in.reshape(1, nb * nc, nx, ny, nz)
-
-    pad = math.ceil(k / 2) - 1
-    if k == 2:
-        x = nn.ZeroPad3d(padding=(0, 1, 0, 1, 0, 1))(x)
-
-    x = F.conv3d(x, ker, stride=1, padding=pad, dilation=1, groups=nb)
-    x = x + shift
-    if use_act:
-        x = F.leaky_relu(x)
-    x = x.reshape(nb, out_ch, nx, ny, nz)
-    return x
+def save_nifti(arr: np.ndarray, output_path: str, spacing=(1.25, 1.25, 1.25)):
+    img = sitk.GetImageFromArray(arr)
+    img.SetSpacing(spacing)
+    img.SetOrigin((0.0, 0.0, 0.0))
+    img.SetDirection((1.0, 0.0, 0.0,
+                      0.0, 1.0, 0.0,
+                      0.0, 0.0, 1.0))
+    sitk.WriteImage(img, output_path)
 
 
-def replay_gin(x_in, layer_kernels, layer_ks):
+@torch.no_grad()
+def get_ortho_hull_3d(x, r=0.005, n=6, seed=42):
     """
-    Replay full GIN3D forward pass with specific kernels.
-    layer_kernels: list of 4 torch tensors (the conv kernels per layer)
-    layer_ks:      list of 4 ints (kernel sizes)
+    Cross-polytopal hull vertices around a single 3D volume.
+
+    x    : (1, C, D, H, W) tensor
+    r    : radius
+    n    : number of vertices (must be even; n/2 orthogonal directions)
+    seed : reproducibility seed
+
+    Returns (n, C, D, H, W) tensor -- the hull vertices.
     """
-    nb, nc, nx, ny, nz = x_in.shape
-    out_channel = 1
+    assert n % 2 == 0, "N_HULL must be even"
+    if seed is not None:
+        torch.manual_seed(seed)
 
-    alpha = torch.rand(nb, 1, 1, 1, 1, device=x_in.device)
-    alpha = alpha.repeat(1, nc, 1, 1, 1)
+    flat_dim = int(np.prod(x.shape[1:]))
+    n_dirs   = n // 2
 
-    x = x_in
-    for i, (ker, k) in enumerate(zip(layer_kernels, layer_ks)):
-        use_act = (i < len(layer_kernels) - 1)
-        x = replay_gin_layer(x, ker, k, use_act=use_act)
-
-    mixed = alpha * x + (1.0 - alpha) * x_in
-
-    _in_frob = torch.norm(x_in.reshape(nb, nc, -1), dim=(-1, -2), p='fro', keepdim=False)
-    _in_frob = _in_frob[:, None, None, None, None].repeat(1, nc, 1, 1, 1)
-    _self_frob = torch.norm(mixed.reshape(nb, out_channel, -1), dim=(-1, -2), p='fro', keepdim=False)
-    _self_frob = _self_frob[:, None, None, None, None].repeat(1, out_channel, 1, 1, 1)
-    mixed = mixed * (1.0 / (_self_frob + 1e-5)) * _in_frob
-
-    return mixed
+    orth = torch.nn.utils.parametrizations.orthogonal(
+        torch.nn.Linear(flat_dim, n_dirs).to(x.device),
+        use_trivialization=False,
+    )
+    dirs   = orth.weight * r                             # (n_dirs, flat_dim)
+    x_flat = x.reshape(1, -1)                            # (1, flat_dim)
+    hull   = torch.cat([x_flat + dirs,
+                        x_flat - dirs], dim=0)           # (n, flat_dim)
+    return hull.reshape(n, *x.shape[1:])
 
 
-def parse_row_kernels(row, device='cpu'):
-    """Parse a CSV row into kernel tensors and kernel sizes."""
-    kernels = []
-    ks = []
-    for i in range(4):
-        k = int(row[f'kernel_size_{i}'])
-        weights = ast.literal_eval(row[f'kernel_{i}'])
-        out_ch, in_ch = LAYER_SHAPES[i]
-        ker = torch.tensor(weights, dtype=torch.float32, device=device).reshape(out_ch, in_ch, k, k, k)
-        kernels.append(ker)
-        ks.append(k)
-    return kernels, ks
-
-
-# ===================== MAIN =====================
+# =====================================================================
+#  MAIN
+# =====================================================================
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # --- Load image ---
-    arr = np.load(NPY_PATH)
-    img_np = arr[:, :, :, 0].astype(np.float32)
-    img_np = normalise_one_one(img_np)
+    basename = os.path.splitext(os.path.basename(NPY_PATH))[0]
 
-    basename = os.path.basename(NPY_PATH).replace('.npy', '')
+    # ------------------------------------------------------------------
+    # 1. Load and normalise the scan
+    # ------------------------------------------------------------------
+    arr    = np.load(NPY_PATH).astype(np.float32)
+    img_np = arr[:, :, :, 0]
+    img_np = _normalise(img_np, SCAN_TYPE)
 
-    # --- Save raw ---
-    raw_nifti_path = os.path.join(OUTPUT_DIR, f'{basename}_raw.nii.gz')
-    raw_png_path = os.path.join(OUTPUT_DIR, f'{basename}_raw_midcoronal.png')
-    generate_nifty(img_np, SPACING, raw_nifti_path)
-    save_mid_coronal_png(img_np, raw_png_path)
-    print(f'Saved raw: {raw_nifti_path}')
+    # ------------------------------------------------------------------
+    # 2. Apply the same spatial transform used during inference
+    # ------------------------------------------------------------------
+    tfm = transforms.Compose([
+        VariableSpatialFix(num_of_double_stride_conv=4, padval=0.5),
+        ToTensor(),
+    ])
+    scan_tensor = tfm(img_np).unsqueeze(0).to(DEVICE)  # (1, 1, D, H, W)
 
-    # --- Parse CSV and index by combo ---
-    df = pd.read_csv(CSV_PATH)
-    print(f'Total CSV rows: {len(df)}')
+    print(f"Scan tensor shape : {tuple(scan_tensor.shape)}")
+    print(f"Generating {N_HULL} hull vertices  (radius={RADIUS}, seed={HULL_SEED}) ...")
 
-    combo_to_rows = {}
-    for _, row in df.iterrows():
-        combo = row_combo(row)
-        combo_to_rows.setdefault(combo, []).append(row)
+    # ------------------------------------------------------------------
+    # 3. Save original scan mid-coronal slice
+    # ------------------------------------------------------------------
+    orig_np   = scan_tensor.squeeze().cpu().numpy()     # (D, H, W)
+    orig_png  = os.path.join(OUTPUT_DIR, f"{basename}_original_midcoronal.png")
+    save_mid_coronal_png(orig_np, orig_png, title="Original")
+    print(f"  Saved original  -> {orig_png}")
 
-    import random
-    combo_to_row = {combo: random.choice(rows) for combo, rows in combo_to_rows.items()}
+    if SAVE_NIFTI:
+        orig_nii = os.path.join(OUTPUT_DIR, f"{basename}_original.nii.gz")
+        save_nifti(orig_np, orig_nii, SPACING)
+        print(f"  Saved NIfTI     -> {orig_nii}")
 
-    print(f'Unique combos found in CSV: {sorted(combo_to_row.keys())}')
+    # ------------------------------------------------------------------
+    # 4. Generate hull vertices and save mid-coronal slices
+    # ------------------------------------------------------------------
+    hull = get_ortho_hull_3d(scan_tensor, r=RADIUS, n=N_HULL, seed=HULL_SEED)
+    # hull shape: (N_HULL, 1, D, H, W)
 
-    # --- Prepare tensor ---
-    img_tensor = torch.from_numpy(img_np).float().unsqueeze(0).unsqueeze(0).to(device)
+    n_dirs = N_HULL // 2
+    for i in range(N_HULL):
+        # Readable label: dir1+, dir1-, dir2+, dir2-, dir3+, dir3-
+        dir_idx  = (i % n_dirs) + 1
+        polarity = "pos" if i < n_dirs else "neg"
+        tag      = f"hull_dir{dir_idx}_{polarity}"
 
-    # --- Generate augmented images ---
-    for combo in DESIRED_COMBOS:
-        if combo not in combo_to_row:
-            print(f'WARNING: combo {combo} not found in CSV, skipping.')
-            continue
+        vol_np  = hull[i].squeeze().cpu().numpy()           # (D, H, W)
+        png_out = os.path.join(OUTPUT_DIR, f"{basename}_{tag}_midcoronal.png")
+        save_mid_coronal_png(vol_np, png_out, title=tag)
+        print(f"  Saved hull[{i}]  {tag:20s} -> {png_out}")
 
-        row = combo_to_row[combo]
-        kernels, ks = parse_row_kernels(row, device=device)
+        if SAVE_NIFTI:
+            nii_out = os.path.join(OUTPUT_DIR, f"{basename}_{tag}.nii.gz")
+            save_nifti(vol_np, nii_out, SPACING)
+            print(f"  Saved NIfTI     -> {nii_out}")
 
-        with torch.no_grad():
-            aug = replay_gin(img_tensor, kernels, ks)
-            aug_np = aug.squeeze().cpu().numpy()
-
-        aug_np = normalise_one_one(aug_np)
-
-        tag = combo.replace('-', '')
-        nifti_path = os.path.join(OUTPUT_DIR, f'{basename}_GIN_{tag}.nii.gz')
-        png_path = os.path.join(OUTPUT_DIR, f'{basename}_GIN_{tag}_midcoronal.png')
-
-        generate_nifty(aug_np, SPACING, nifti_path)
-        save_mid_coronal_png(aug_np, png_path)
-        print(f'Saved {combo}: {nifti_path}')
+    print(f"\nDone. {1 + N_HULL} images saved to: {os.path.abspath(OUTPUT_DIR)}/")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -32,10 +32,10 @@ def generate_data_for_box_plot(df_list):
 
 
 # Example data loading
-df = pd.read_csv('./test_result_csv/unet_td1_prev_data.csv')
-df_1 = pd.read_csv('./test_result_csv/bunet_causality_paper_td1_prev_data_wo_clipping.csv')
-df_2 = pd.read_csv('./test_result_csv/bunet_only_gin_td1_prev_data_wo_clipping.csv')
-df_3 = pd.read_csv('./test_result_csv/bunet_gin_only_td1_roughness_enforced_prev_data_wo_clipping.csv')
+df = pd.read_csv('./test_result_csv/unet_td1.csv')
+df_1 = pd.read_csv('./test_result_csv/bunet_disintangled_causality_paper_wo_kl_w_tversky_trained_with_only_ct.csv')
+df_2 = pd.read_csv('./test_result_csv/bunet_disintangled_causality_paper_wo_kl_wo_ipa_w_tversky_td1.csv')
+df_3 = pd.read_csv('./test_result_csv/td1_roughness_enforced_5_normalised_gin.csv')
 # df_4 = pd.read_csv('./test_result_csv/bunet_disintangled_1.25mm.csv')
 
 df_list = [df, df_1, df_2, df_3]#, df_4]

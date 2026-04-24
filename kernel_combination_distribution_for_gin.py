@@ -68,7 +68,7 @@ def build_combo_label(combo_tuple):
 
 def main():
     # ---- Configuration ----
-    csv_path = './log/augmentation_weights_log_causality_train_td1_roughness_enforced_2_normalised_gin_saved_on_best_test.csv'
+    csv_path = './log/augmentation_weights_log_causality_train_td1_roughness_enforced_5_normalised_gin_saved_on_best_test.csv'
     output_dir = './results_plots'
     roughness_threshold = 0.5
 
@@ -175,7 +175,7 @@ def main():
     )
     fig.tight_layout()
 
-    save_path = os.path.join(output_dir, 'kernel_roughness_combination_histogram_roughness_enforced_2_normalised_gin_train_with_ct_only_saved_on_best_test.png')
+    save_path = os.path.join(output_dir, 'kernel_roughness_combination_histogram_roughness_enforced_5_train_with_ct_only_saved_on_best_test.png')
     fig.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f"Plot saved to {save_path}")
     plt.close(fig)
