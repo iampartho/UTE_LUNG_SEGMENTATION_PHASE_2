@@ -203,9 +203,8 @@ class GradlessGCReplayNonlinBlock3D(nn.Module):
         # print(f"Kernel size: {k} and Padding: {pad}")
         
         if k == 2:
-            # print("Before zero padding x_in shape: ", x_in.shape)
-            x_in = nn.ZeroPad3d(padding=(0, 1, 0, 1, 0, 1))(x_in)
-            # print("After zero padding x_in shape: ", x_in.shape)
+            # nn.ZeroPad3d is not available in older torch builds; functional pad is equivalent.
+            x_in = F.pad(x_in, pad=(0, 1, 0, 1, 0, 1), mode='constant', value=0.0)
         
         
 

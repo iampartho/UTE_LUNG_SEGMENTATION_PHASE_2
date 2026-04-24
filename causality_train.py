@@ -1,5 +1,6 @@
 import os
 import sys
+import math
 import shutil
 import torch
 import pandas as pd
@@ -10,7 +11,7 @@ from torchvision import transforms, utils
 from torch import nn
 from torch.utils.data import DataLoader
 #from monai.networks.nets import UNETR
-from monai.losses import DiceLoss, DiceCELoss, TverskyLoss,GeneralizedDiceLoss, DiceFocalLoss, GeneralizedDiceFocalLoss, HausdorffDTLoss
+from monai.losses import TverskyLoss
 from monai.inferers import SlidingWindowInferer
 #from monai import metrics
 from datetime import date
@@ -18,7 +19,7 @@ today = date.today()
 from datasets_causality import CausalityDataset, ToTensor, VariableSpatialFix, RandomCrop
 import torch.nn.functional as F
 import SimpleITK as sitk
-
+import tqdm
 
 
 #For Mixed Precision
@@ -37,6 +38,10 @@ import torch.nn.parallel
 from basic_unet_disentagled import BasicUNet
 from gin_with_log_capability import CausalityAugmentation3D
 
+# Local Complexity (LC) tracking during training
+from compute_local_complexity_unet import UNetLocalComplexity
+from eval_step_1 import normalise_hu as lc_normalise_hu, normalise_one_one as lc_normalise_one_one
+
 #from unet_2_dec import UNet
 
 
@@ -45,6 +50,147 @@ global_loss = np.inf
 global_train_loss = np.inf
 epoch_since_loss_didnt_improve = 0
 LAMBDA_DIV = 1
+
+# =====================================================================
+#  Local Complexity (LC) tracking configuration
+# =====================================================================
+LC_TRAIN_SCANS_CSV = './ids/only_copd_1.25mm.csv'
+LC_VAL_SCANS_CSV = './ids/only_ute_1.25mm.csv'
+LC_NUM_TRAIN_SCANS = 110
+LC_INTERVAL = 400                 # Compute LC every N optimizer steps
+LC_WEIGHT_START_STEP = 2000       # Only start tracking best-LC weight after this many steps
+LC_RADIUS = 0.001
+LC_N_HULL = 10
+LC_HULL_SEED = 42
+LC_HULL_BATCH_SIZE = 1
+LC_MUL_FACTOR = 16                # 2 ** num_of_double_stride_conv (=4)
+LC_PADVAL = 0.5
+LC_LOG_DIR = './log/local_complexity_monitoring_during_training'
+LC_TRAIN_CSV_PATH = os.path.join(LC_LOG_DIR, 'train_lc.csv')
+LC_TEST_CSV_PATH = os.path.join(LC_LOG_DIR, 'test_lc.csv')
+LC_WEIGHT_SAVE_PATH = './save_models/lc_monitoring/best_bunet_causality_lowest_lc.pth'
+PER_EPOCH_WEIGHT_DIR = './save_models/lc_monitoring'
+
+# Module-level LC tracking state (persists across epochs within a run)
+global_opt_step = 0
+min_train_avg_total_lc = np.inf
+min_test_avg_total_lc = np.inf
+
+
+def _prepare_lc_input(path, scan_type, device):
+    """Replicate the preprocessing used in compute_local_complexity_unet.py."""
+    arr = np.load(path).astype(np.float32)
+    img = arr[:, :, :, 0]
+
+    if scan_type == "UTE":
+        img = lc_normalise_one_one(img)
+    else:
+        img = lc_normalise_one_one(lc_normalise_hu(img))
+
+    h, w, d = img.shape
+    new_h = LC_MUL_FACTOR * math.ceil(h / LC_MUL_FACTOR)
+    new_w = LC_MUL_FACTOR * math.ceil(w / LC_MUL_FACTOR)
+    new_d = LC_MUL_FACTOR * math.ceil(d / LC_MUL_FACTOR)
+    img = np.pad(
+        img,
+        ((0, new_h - h), (0, new_w - w), (0, new_d - d)),
+        'constant',
+        constant_values=LC_PADVAL,
+    )
+    tensor = torch.from_numpy(img).unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
+    return tensor.to(device)
+
+
+def _compute_avg_lc(lc_helper, paths, scan_type, device):
+    """Compute LC on every scan in `paths` and return the average total_lc and
+    the average per-layer LC across all scans.
+
+    Returns
+    -------
+    avg_total_lc : float
+    avg_per_layer_lc : dict {layer_name: float}
+    """
+    layer_names = lc_helper.layer_names
+    total_sum = 0.0
+    per_layer_sum = {name: 0.0 for name in layer_names}
+    n = 0 # number of scans
+
+    for p in tqdm.tqdm(paths, desc="Computing LC..."):
+        tensor = _prepare_lc_input(p, scan_type, device)
+        r = lc_helper.compute(
+            tensor,
+            r=LC_RADIUS,
+            n_hull=LC_N_HULL,
+            seed=LC_HULL_SEED,
+            hull_batch_size=LC_HULL_BATCH_SIZE,
+        )
+        total_sum += float(r['total_lc'])
+        for name in layer_names:
+            per_layer_sum[name] += float(r['per_layer_lc'][name])
+        n += 1
+
+        del tensor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    avg_total_lc = total_sum / n
+    avg_per_layer_lc = {name: per_layer_sum[name] / n for name in layer_names}
+    return avg_total_lc, avg_per_layer_lc
+
+
+def _append_lc_row(csv_path, opt_step, epoch, avg_total_lc, avg_per_layer_lc):
+    """Append a single row (one optimization step) to the LC CSV."""
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+    row = {
+        'opt_step': int(opt_step),
+        'epoch': int(epoch),
+        'avg_total_lc': avg_total_lc,
+    }
+    for name, val in avg_per_layer_lc.items():
+        row[f"avg_lc_{name}"] = val
+
+    if os.path.exists(csv_path):
+        try:
+            df = pd.read_csv(csv_path)
+        except pd.errors.EmptyDataError:
+            df = pd.DataFrame()
+    else:
+        df = pd.DataFrame()
+
+    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    df.to_csv(csv_path, index=False)
+
+
+def _run_lc_eval_and_maybe_save(model, lc_helper, lc_train_paths, lc_val_paths,
+                                device, opt_step, epoch):
+    """Compute LC on the fixed train & validation scan subsets, log averages to
+    CSV, and save the current weight as the lowest-LC checkpoint when both
+    average train and test total_lc beat their historical minima (after the
+    warm-up period)."""
+    global min_train_avg_total_lc, min_test_avg_total_lc
+
+    print(f"\n[LC] step {opt_step}: computing local complexity "
+          f"on {len(lc_train_paths)} train scans and {len(lc_val_paths)} val scans ...")
+
+    train_avg_total, train_avg_layers = _compute_avg_lc(lc_helper, lc_train_paths, "CT", device)
+    val_avg_total, val_avg_layers = _compute_avg_lc(lc_helper, lc_val_paths, "UTE", device)
+
+    _append_lc_row(LC_TRAIN_CSV_PATH, opt_step, epoch, train_avg_total, train_avg_layers)
+    _append_lc_row(LC_TEST_CSV_PATH, opt_step, epoch, val_avg_total, val_avg_layers)
+
+    print(f"[LC] step {opt_step}: avg train total_lc={train_avg_total:.4f}, "
+          f"avg test total_lc={val_avg_total:.4f}")
+
+    if opt_step > LC_WEIGHT_START_STEP:
+        if train_avg_total < min_train_avg_total_lc and val_avg_total < min_test_avg_total_lc:
+            print(f"[LC] step {opt_step}: BOTH train ({train_avg_total:.4f} < {min_train_avg_total_lc:.4f}) "
+                  f"and test ({val_avg_total:.4f} < {min_test_avg_total_lc:.4f}) improved. "
+                  f"Saving LC-best weight.")
+            min_train_avg_total_lc = train_avg_total
+            min_test_avg_total_lc = val_avg_total
+            os.makedirs(os.path.dirname(LC_WEIGHT_SAVE_PATH), exist_ok=True)
+            torch.save(model.state_dict(), LC_WEIGHT_SAVE_PATH)
 
 
 def log_augmentation_weights(csv_path, filename, loss_value, params):
@@ -193,7 +339,8 @@ def binary_kl_consistency_loss(pred1_logits, pred2_logits, lambda_div=10.0):
 
 
 
-def train(dataloader, model, optimizer, epoch, bce_criterion, dice_criterion, augmentor, df, scaler=None):
+def train(dataloader, model, optimizer, epoch, bce_criterion, dice_criterion, augmentor, df, scaler=None,
+          lc_helper=None, lc_train_paths=None, lc_val_paths=None, device=None):
     ''' 
         dataloader => it is the pytorch dataloader created from a pytorch dataset
         model => it is the actual model where we will give the images for forward propagation
@@ -201,6 +348,10 @@ def train(dataloader, model, optimizer, epoch, bce_criterion, dice_criterion, au
         epoch => the current number of the epoch
         net => the name of the network (string)
         df => an empty daframe containing two columns of train loss and test loss
+        lc_helper => UNetLocalComplexity instance for computing LC every LC_INTERVAL steps
+        lc_train_paths => list of training scan file paths for LC evaluation
+        lc_val_paths   => list of validation scan file paths for LC evaluation
+        device => torch device
 
     '''
     print(f"\n\n========================== Training Epoch {epoch}===================\n\n")
@@ -208,7 +359,7 @@ def train(dataloader, model, optimizer, epoch, bce_criterion, dice_criterion, au
     model.train()
     augmentor.eval()
 
-    log_csv_path = './log/augmentation_weights_log_causality_train_td1_roughness_enforced_5_normalised_gin.csv'
+    log_csv_path = './log/augmentation_weights_log_td1_roughness_enforced_lc_monitor.csv'
     if not os.path.exists('./log'):
         os.makedirs('./log')
 
@@ -254,36 +405,36 @@ def train(dataloader, model, optimizer, epoch, bce_criterion, dice_criterion, au
                 #print(X.shape)
 
                 pred_1 = model(aug_view1)
-                pred_2 = model(aug_view2)
-                
-
-                # --- C. Calculate Supervised Losses (BCE + Dice) ---
-                # Loss for View 1
-                loss_bce_1 = bce_criterion(pred_1, y)
+                # pred_2 = model(aug_view2)
                 loss_dice_1 = dice_criterion(pred_1, y)
-                total_seg_loss_1 = loss_bce_1 + loss_dice_1
-                # total_seg_loss_1 = dice_criterion(pred_1, y)
+
+                # # --- C. Calculate Supervised Losses (BCE + Dice) ---
+                # # Loss for View 1
+                # loss_bce_1 = bce_criterion(pred_1, y)
+                # loss_dice_1 = dice_criterion(pred_1, y)
+                # total_seg_loss_1 = loss_bce_1 + loss_dice_1
+                # # total_seg_loss_1 = dice_criterion(pred_1, y)
                 
-                # Loss for View 2
-                loss_bce_2 = bce_criterion(pred_2, y)
-                loss_dice_2 = dice_criterion(pred_2, y)
-                total_seg_loss_2 = loss_bce_2 + loss_dice_2
+                # # Loss for View 2
+                # loss_bce_2 = bce_criterion(pred_2, y)
+                # loss_dice_2 = dice_criterion(pred_2, y)
+                # total_seg_loss_2 = loss_bce_2 + loss_dice_2
                 
-                # --- D. Calculate Consistency Loss (KL Divergence) ---
-                # Enforce invariance: Prediction on View 1 should be close to View 2 [cite: 332]
-                # We calculate bidirectional consistency for stability
-                kl_dist_1_to_2 = binary_kl_consistency_loss(pred_1, pred_2, lambda_div=10.0)
-                kl_dist_2_to_1 = binary_kl_consistency_loss(pred_2, pred_1, lambda_div=10.0)
-                consistency_loss = (kl_dist_1_to_2 + kl_dist_2_to_1) / 2.0
+                # # --- D. Calculate Consistency Loss (KL Divergence) ---
+                # # Enforce invariance: Prediction on View 1 should be close to View 2 [cite: 332]
+                # # We calculate bidirectional consistency for stability
+                # kl_dist_1_to_2 = binary_kl_consistency_loss(pred_1, pred_2, lambda_div=10.0)
+                # kl_dist_2_to_1 = binary_kl_consistency_loss(pred_2, pred_1, lambda_div=10.0)
+                # consistency_loss = (kl_dist_1_to_2 + kl_dist_2_to_1) / 2.0
                 
-                # --- E. Total Loss ---
-                # Paper Eq. 3: Seg Loss(View1) + Seg Loss(View2) + Consistency
-                total_loss = total_seg_loss_1 + total_seg_loss_2 + consistency_loss
+                # # --- E. Total Loss ---
+                # # Paper Eq. 3: Seg Loss(View1) + Seg Loss(View2) + Consistency
+                # total_loss = total_seg_loss_1 + total_seg_loss_2 + consistency_loss
                 # total_loss = total_seg_loss_1
 
 
                 
-            scaler.scale(total_loss).backward()
+            scaler.scale(loss_dice_1).backward()
             scaler.step(optimizer) 
             scaler.update()
             optimizer.zero_grad()
@@ -329,6 +480,25 @@ def train(dataloader, model, optimizer, epoch, bce_criterion, dice_criterion, au
         if use_gin and gin_params is not None:
             f_name = fname[0] if isinstance(fname, (tuple, list)) else fname
             log_augmentation_weights(log_csv_path, f_name, total_loss.item(), gin_params)
+
+        # ------------------------------------------------------------------
+        # Local Complexity (LC) tracking: every LC_INTERVAL optimization steps
+        # compute LC on the fixed train/val scan subsets and log to CSVs.
+        # Save the best-LC weight once opt_step > LC_WEIGHT_START_STEP and both
+        # train & test LC sums beat their historical minima simultaneously.
+        # ------------------------------------------------------------------
+        global global_opt_step
+        global_opt_step += 1
+        if (lc_helper is not None and lc_train_paths is not None and lc_val_paths is not None
+                and global_opt_step % LC_INTERVAL == 0):
+            was_training = model.training
+            _run_lc_eval_and_maybe_save(
+                model, lc_helper, lc_train_paths, lc_val_paths,
+                device, global_opt_step, epoch,
+            )
+            if was_training:
+                model.train()
+                augmentor.eval()
 
         pred_np = torch.sigmoid(pred_1).squeeze().detach().cpu().numpy()
         label_np = y.squeeze().detach().cpu().numpy()
@@ -403,8 +573,8 @@ def test(dataloader, model, epoch, bce_criterion, dice_criterion, df, scheduler=
     #     cval=0.0                    # Constant value for padding
     # )
     
-    log_csv_path = './log/augmentation_weights_log_causality_train_td1_roughness_enforced_5_normalised_gin.csv'
-    save_on_best_test_log_csv_path = './log/augmentation_weights_log_causality_train_td1_roughness_enforced_5_normalised_gin_saved_on_best_test.csv'
+    log_csv_path = './log/augmentation_weights_log_td1_roughness_enforced_lc_monitor.csv'
+    save_on_best_test_log_csv_path = './log/augmentation_weights_log_td1_roughness_enforced_lc_monitor_saved_on_best_test.csv'
 
     with torch.no_grad():
         for X, y, _ in dataloader:
@@ -468,7 +638,7 @@ def test(dataloader, model, epoch, bce_criterion, dice_criterion, df, scheduler=
             #print(f"\nTargeted IOU improved from {global_target_iou} to {target_iou} . Saving the current weight\n\n\n\n\n")
             global_loss = val_loss
             epoch_since_loss_didnt_improve=0
-            torch.save(model.state_dict(), './save_models/'+ 'best_bunet_causality_paper_ct_train_UTE_test_w_tversky_wo_kl_only_gin_roughness_enforced_5_normalised_gin.pth')
+            torch.save(model.state_dict(), './save_models/'+ 'best_bunet_roughness_enforced_td1_lc_monitor.pth')
             print("Model saved successfully")
             if os.path.exists(log_csv_path):
                 shutil.copy(log_csv_path, save_on_best_test_log_csv_path)
@@ -511,13 +681,6 @@ def main():
     gen = BasicUNet()
 
 
-
-        # Check if multiple GPUs are available
-    if torch.cuda.device_count() > 1:
-        print("Let's use", torch.cuda.device_count(), "GPUs!")
-
-        # Wrap the model with DataParallel
-        gen = nn.DataParallel(gen)
     
     gen = gen.to(device)
 
@@ -543,7 +706,7 @@ def main():
     print('training data')
     
 
-    epochs = 400
+    epochs = 500
     df_train = pd.DataFrame(columns=['epoch','loss'])
     df_test = pd.DataFrame(columns=['epoch','loss','IOU','precision'])
 
@@ -553,27 +716,42 @@ def main():
     # loss_fn = TverskyLoss(sigmoid=True)
     augmentor = CausalityAugmentation3D(in_channels=1).to(device)
 
+    # ---- Local Complexity (LC) evaluation setup ----
+    os.makedirs(LC_LOG_DIR, exist_ok=True)
+    os.makedirs(PER_EPOCH_WEIGHT_DIR, exist_ok=True)
+    lc_train_paths = pd.read_csv(LC_TRAIN_SCANS_CSV)['filepaths'].tolist()[:LC_NUM_TRAIN_SCANS]
+    lc_val_paths = pd.read_csv(LC_VAL_SCANS_CSV)['filepaths'].tolist()
+    lc_helper = UNetLocalComplexity(gen, device=device, target_layers="all")
+    print(f"[LC] Tracking LC on {len(lc_train_paths)} train scans and {len(lc_val_paths)} val scans "
+          f"every {LC_INTERVAL} opt steps; saving LC-best weight after step {LC_WEIGHT_START_STEP}.")
+
     for t in range(epochs):
 
         
         # test(test_dataloader, gen, t, net, df_test, scheduler)
-        train(train_dataloader, gen, optimizer, t, bce_criterion, dice_criterion, augmentor, df_train, scaler)
+        train(train_dataloader, gen, optimizer, t, bce_criterion, dice_criterion, augmentor, df_train, scaler,
+              lc_helper=lc_helper, lc_train_paths=lc_train_paths, lc_val_paths=lc_val_paths, device=device)
 
         test(test_dataloader, gen, t, bce_criterion, dice_criterion, df_test, scheduler) # 
+
+        # ---- Per-epoch weight snapshot (always saved, regardless of loss/LC) ----
+        per_epoch_path = os.path.join(PER_EPOCH_WEIGHT_DIR, f'latest_epoch_bunet_causality.pth')
+        torch.save(gen.state_dict(), per_epoch_path)
+        print(f"[per-epoch] saved weight to {per_epoch_path}")
         
         # df_train.at[t, 'lr'] = optimizer.param_groups[0]['lr']
         # df_test.at[t, 'lr'] = optimizer.param_groups[0]['lr']
         
-        df_train.to_csv('./log/train_metrics_' + net + '_causality_paper_ct_train_UTE_test_w_tversky_wo_kl_only_gin_td1_roughness_enforced_5_normalised_gin.csv', index=False)
-        df_test.to_csv('./log/test_metrics_' + net + '_causality_papery_ct_train_UTE_test_w_tversky_wo_kl_only_gin_td1_roughness_enforced_5_normalised_gin.csv', index=False)
+        df_train.to_csv('./log/train_metrics_' + net + '_roughness_enforced_gin_td1_with_lc_monitoring.csv', index=False)
+        df_test.to_csv('./log/test_metrics_' + net + '_roughness_enforced_gin_td1_with_lc_monitoring.csv', index=False)
         
         sys.stdout.flush()
 
         
-        if epoch_since_loss_didnt_improve > 100:
-            print(f"\n\n\nIt has been more than {epoch_since_loss_didnt_improve} epoch since the Validation loss improved. So, terminating training.\n\n\n")
-            #torch.save(gen.state_dict(), './save_models/'+ f'epoch_{t}_ute_HD_loss_swin_join_train_12.pth')
-            break
+        # if epoch_since_loss_didnt_improve > 100:
+        #     print(f"\n\n\nIt has been more than {epoch_since_loss_didnt_improve} epoch since the Validation loss improved. So, terminating training.\n\n\n")
+        #     #torch.save(gen.state_dict(), './save_models/'+ f'epoch_{t}_ute_HD_loss_swin_join_train_12.pth')
+        #     break
 
     print("Done!")
 

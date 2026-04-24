@@ -52,15 +52,17 @@ from torchvision import transforms
 from basic_unet_disentagled import BasicUNet
 
 from eval_step_1 import normalise_one_one, normalise_zero_one, normalise_hu, VariableSpatialFix, ToTensor
+from save_lc_nifti import save_lc_nifti
 
 # =====================================================================
 #  CONFIGURATION — edit these variables before running
 # =====================================================================
 
-df = pd.read_csv("./ids/only_copd_1.25mm.csv")
-SCAN_PATHS = df["filepaths"].tolist()
+# df = pd.read_csv("./ids/UTE_MRI_previous_numpy_without_clipping.csv")
+# SCAN_PATHS = df["filepaths"].tolist()
 # random.shuffle(SCAN_PATHS)
-SCAN_PATHS = SCAN_PATHS[:110]
+# SCAN_PATHS = SCAN_PATHS[:110]
+SCAN_PATHS = ["/Shared/lss_segerard/parthghosh/data/COPDgene_CT_1.25mm_numpy/15278Y_FRC.npy"]
 SCAN_TYPE = ["CT" for _ in range(len(SCAN_PATHS))]
 
 # SCAN_PATHS = [
@@ -72,18 +74,19 @@ SCAN_TYPE = ["CT" for _ in range(len(SCAN_PATHS))]
 #     "UTE"
 # #     "CT",
 # ]
-MODEL_WEIGHT_PATH = "./save_models/best_bunet_causality_paper_ct_train_UTE_test_w_tversky_wo_kl.pth"
+MODEL_WEIGHT_PATH = "./save_models/best_bunet_causality_paper_ct_train_UTE_test_w_tversky_wo_kl_only_gin_roughness_enforced_5_normalised_gin.pth"
 
-OUTPUT_DIR = "log_local_complexity/causality_paper_model_COPD_CT_110"
+OUTPUT_DIR = "log_local_complexity"
 
 RADIUS = 0.005          # Neighbourhood radius — keep small for deep nets (paper uses 0.005)
 N_HULL = 10             # Must be even.  P = N_HULL/2 orthogonal directions.
 HULL_SEED = 42          # Reproducibility seed for hull sampling
-HULL_BATCH_SIZE = 1     # Hull vertices forwarded per sub-batch (tune for GPU RAM)
+HULL_BATCH_SIZE = 2     # Hull vertices forwarded per sub-batch (tune for GPU RAM)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- Voxel-specific LC ---
-COMPUTE_VOXEL_LC = False
+COMPUTE_VOXEL_LC = True
+SAVE_LC_NIFTI    = True   # Save a NIfTI image encoding per-voxel LC category (0/1/2/3)
 VOXEL_INDICES = [
     # (d, h, w) tuples in output-space coordinates, e.g.:
     # (0, 120, 70),
@@ -201,7 +204,7 @@ class UNetLocalComplexity:
 
     @torch.no_grad()
     def compute(self, scan, r=0.005, n_hull=10, seed=42,
-                hull_batch_size=2, voxel_indices=None):
+                hull_batch_size=2, compute_voxel_lc=False, voxel_indices=None, ground_truth=None):
         """
         Compute LC for a single scan.
 
@@ -220,10 +223,49 @@ class UNetLocalComplexity:
             total_lc        — int, sum of per-layer global LC
             per_layer_lc    — {name: int}
             compute_time    — float (seconds)
+            compute_voxel_lc — boolean, whether to compute voxel-specific LC
             voxel_lc        — list of dicts (only if voxel_indices given)
         """
         was_training = self.model.training
         self.model.eval()
+
+        
+
+
+        # Populate voxel_indices with the indices of the non-zero voxels in the predicted segmentation
+        if compute_voxel_lc and len(voxel_indices) == 0:
+            pred_seg = self.model(scan)
+            pred_seg = torch.sigmoid(pred_seg)
+            pred_seg[pred_seg > 0.5] = 1
+            pred_seg[pred_seg <= 0.5] = 0
+            pred_seg_np = pred_seg.detach().cpu().numpy()
+            pred_seg_np = pred_seg_np.squeeze()
+            pred_seg_np = pred_seg_np.astype(np.uint8)
+
+            gt_h, gt_w, gt_d = ground_truth.shape
+            pred_seg_np = pred_seg_np[:gt_h, :gt_w, :gt_d]
+
+            # Populate voxel_indices with the indices of all voxels in the predicted segmentation
+            voxel_indices = np.where(pred_seg_np == 1)
+            voxel_indices = list(zip(voxel_indices[0], voxel_indices[1], voxel_indices[2]))
+
+            # Populate voxel_indices with the indices of true positive(both predicted and ground truth are 1) voxels in the ground truth
+            # voxel_indices = np.where((pred_seg_np == 1) & (ground_truth == 1))
+            # voxel_indices = list(zip(voxel_indices[0], voxel_indices[1], voxel_indices[2]))
+
+            # Populate voxel_indices with the indices of False Positive (predicted 1 and ground truth 0) voxels in the ground truth
+            # voxel_indices = np.where((pred_seg_np == 1) & (ground_truth == 0))
+            # voxel_indices = list(zip(voxel_indices[0], voxel_indices[1], voxel_indices[2]))
+
+            # # Populate voxel_indices with the indices of False Negative (predicted 0 and ground truth 1) voxels in the ground truth
+            # voxel_indices = np.where((pred_seg_np == 0) & (ground_truth == 1))
+            # voxel_indices = list(zip(voxel_indices[0], voxel_indices[1], voxel_indices[2]))
+
+            # # Populate voxel_indices with the indices of True Negative (predicted 0 and ground truth 0) voxels in the ground truth
+            # voxel_indices = np.where(pred_seg_np == 0 & ground_truth == 0)
+            # voxel_indices_true_negative = list(zip(voxel_indices[0], voxel_indices[1], voxel_indices[2]))
+
+
         self._register_hooks()
 
         t0 = time.time()
@@ -411,6 +453,7 @@ def main():
         scan = np.load(path).astype(np.float32)
         
         img = scan[:,:,:,0]
+        ground_truth = scan[:,:,:,1]
 
         if SCAN_TYPE[i] == "UTE":
             img = normalise_one_one(img)
@@ -426,13 +469,19 @@ def main():
             n_hull=N_HULL,
             seed=HULL_SEED,
             hull_batch_size=HULL_BATCH_SIZE,
+            compute_voxel_lc=COMPUTE_VOXEL_LC,
             voxel_indices=voxel_indices,
+            ground_truth=ground_truth,
         )
 
         log_results_to_csv(
             result, path, lc.layer_names, OUTPUT_DIR,
             RADIUS, N_HULL, MODEL_WEIGHT_PATH,
         )
+
+        if SAVE_LC_NIFTI:
+            save_lc_nifti(result, path, ground_truth.shape, OUTPUT_DIR)
+
         print(f"done ({result['compute_time']:.1f}s)")
 
     print(f"\nResults saved to {OUTPUT_DIR}/")
