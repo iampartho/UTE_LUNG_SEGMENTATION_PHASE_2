@@ -22,16 +22,16 @@ def main():
                "sdsd":[],
                "hd":[]}
     
-    all_gt_files = glob.glob("./prediction/temp/*_gt.nii.gz")
+    all_gt_files = glob.glob("./prediction/temp_pred125_eval1mm/*_gt_1mm.nii.gz")
 
     for idx in tqdm.tqdm(range(len(all_gt_files))):
 
         
         true_mask_path = all_gt_files[idx]
 
-        filename = os.path.basename(true_mask_path).split('_gt.nii.gz')[0]
+        filename = os.path.basename(true_mask_path).split('_gt_1mm.nii.gz')[0]
 
-        pred_mask_path = true_mask_path.replace('_gt.nii.gz', '_pred.nii.gz')
+        pred_mask_path = true_mask_path.replace('_gt_1mm.nii.gz', '_pred_1mm.nii.gz')
 
         print("true_mask_path", true_mask_path, "\n\n")
         print("pred_mask_path", pred_mask_path, "\n\n")
@@ -68,7 +68,7 @@ def main():
         print(results)
     df = pd.DataFrame(results)
     os.makedirs("./test_result_csv", exist_ok=True)
-    df.to_csv("./test_result_csv/td1_roughness_enforced_5_normalised_gin_prev_data.csv",index=False)
+    df.to_csv("./test_result_csv/UTE_MRI_ILD_1.25mm_to_1mm_SPACING_WITH_MASK_TOTALSEGMENTOR_causality_paper.csv",index=False)
 
 
 

@@ -11,7 +11,6 @@ import math
 from skimage import exposure
 from skimage.morphology import binary_erosion, binary_opening
 from monai.inferers import SlidingWindowInferer
-import nibabel as nib
 #from monai.networks.nets import UNETR
 
 from basic_unet_disentagled import BasicUNet
@@ -22,12 +21,15 @@ import glob
 # from monai.networks.nets import BasicUNet,BasicUNetPlusPlus
 
 def generate_confusion_mask(gt_path, pred_path, output_path):
-    # Load the NIfTI files
-    gt_nii = nib.load(gt_path)
-    pred_nii = nib.load(pred_path)
+    # Load images with SimpleITK
+    gt_img = sitk.ReadImage(gt_path)
+    pred_img = sitk.ReadImage(pred_path)
 
-    gt = gt_nii.get_fdata().astype(np.uint8)
-    pred = pred_nii.get_fdata().astype(np.uint8)
+    gt = sitk.GetArrayFromImage(gt_img).astype(np.uint8)
+    pred = sitk.GetArrayFromImage(pred_img).astype(np.uint8)
+
+    if gt.shape != pred.shape:
+        raise ValueError(f"Shape mismatch: GT {gt.shape} vs Pred {pred.shape}")
 
     # Initialize confusion mask
     confusion = np.zeros_like(gt, dtype=np.uint8)
@@ -41,9 +43,10 @@ def generate_confusion_mask(gt_path, pred_path, output_path):
     # False Negative (FN): prediction is 0, GT is 1
     confusion[(gt == 1) & (pred == 0)] = 3
 
-    # Save the confusion mask
-    confusion_nii = nib.Nifti1Image(confusion, affine=gt_nii.affine, header=gt_nii.header)
-    nib.save(confusion_nii, output_path)
+    # Save with GT spatial metadata (origin, spacing, direction)
+    confusion_img = sitk.GetImageFromArray(confusion)
+    confusion_img.CopyInformation(gt_img)
+    sitk.WriteImage(confusion_img, output_path)
 
 
 
@@ -229,7 +232,7 @@ def model_ct_wrapper(x):
 # test_df = pd.concat([test_df1, test_df2])
 
 if __name__ == "__main__":
-    test_df = pd.read_csv('./ids/UTE_MRI_previous_numpy_without_clipping.csv') #pd.read_csv('./ids/UTE_MRI_previous_numpy.csv') #pd.read_csv('./ids/causality_test_ute_copd.csv')
+    test_df = pd.read_csv('./ids/UTE_MRI_ILD_WITH_MASK_TOTALSEGMENTOR_resampled_1.25mm.csv') #pd.read_csv('./ids/UTE_MRI_previous_numpy.csv') #pd.read_csv('./ids/causality_test_ute_copd.csv')
 
     all_files = test_df['filepaths'].values
     # all_files = test_df['filepaths'].values
@@ -239,7 +242,7 @@ if __name__ == "__main__":
     model = BasicUNet().to(device)
 
 
-    checkpoint = './save_models/best_bunet_causality_paper_ct_train_UTE_test_w_tversky_wo_kl_only_gin_roughness_enforced_5_normalised_gin.pth'
+    checkpoint = './save_models/best_bunet_causality_paper_ct_train_UTE_test_w_tversky_wo_kl.pth'
 
     # checkpoint_gin = './save_models/best_augmentor_learnable_gin_mode_4.pth'
 
@@ -336,8 +339,8 @@ if __name__ == "__main__":
 
             pred_np = pred.detach().squeeze().cpu().numpy().astype(np.uint8)
             # pred_np = pred_np[:h, :w, :d]
-            # generate_nifty(img_np, (1.25,1.25,1.25), f"{output_nifty_dir}/{filename.split('.npy')[0]}_input_op.nii.gz")
-            generate_nifty(pred_np, (1.25,1.25,1.25), f"{output_nifty_dir}/{filename.split('.npy')[0]}_pred.nii.gz")
-            generate_nifty(gt_tensor.squeeze().cpu().numpy(), (1.25,1.25,1.25), f"{output_nifty_dir}/{filename.split('.npy')[0]}_gt.nii.gz")
+            generate_nifty(img_np, (1,1,1), f"{output_nifty_dir}/{filename.split('.npy')[0]}_input_op.nii.gz")
+            generate_nifty(pred_np, (1,1,1), f"{output_nifty_dir}/{filename.split('.npy')[0]}_pred.nii.gz")
+            generate_nifty(gt_tensor.squeeze().cpu().numpy(), (1,1,1), f"{output_nifty_dir}/{filename.split('.npy')[0]}_gt.nii.gz")
 
-            # generate_confusion_mask(f"{output_nifty_dir}/{filename.split('.npy')[0]}_gt.nii.gz", f"{output_nifty_dir}/{filename.split('.npy')[0]}_pred_unet.nii.gz", f"{output_nifty_dir}/{filename.split('.npy')[0]}_confusion_unet.nii.gz")
+            generate_confusion_mask(f"{output_nifty_dir}/{filename.split('.npy')[0]}_gt.nii.gz", f"{output_nifty_dir}/{filename.split('.npy')[0]}_pred.nii.gz", f"{output_nifty_dir}/{filename.split('.npy')[0]}_confusion_unet.nii.gz")

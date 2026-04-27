@@ -67,18 +67,19 @@ def main():
     csv = args.csv
     #outdir = args.outdir
 
-    all_img_file_dir = glob.glob('/Shared/lss_segerard/data/COPDGene-RV-FRC/*/ct_data/*.nii.gz')
+    all_img_file_dir = glob.glob('/Shared/lss_segerard/data/UTE_MRI_ILD/UTE/*.nii.gz')
     #all_mask_file_dir = glob.glob('/Shared/lss_segerard/data/COPDGene-RV-FRC/*/pass/*.nii.gz')
 
-    output_dir = '/Shared/lss_segerard/parthghosh/data/COPDgene_CT_1.25mm_numpy'
+    output_dir = '/Shared/lss_segerard/parthghosh/data/UTE_MRI_ILD_ORIGINAL_SPACING_WITH_MASK_TOTALSEGMENTOR_resampled_1.25mm'
     os.makedirs(output_dir, exist_ok=True)
     for idx in tqdm.tqdm(range(len(all_img_file_dir))):
 
         img_filepath = all_img_file_dir[idx]
-        mask_filepath = img_filepath.split('/ct_data')[0] + '/pass/' + os.path.basename(img_filepath).split('.nii.gz')[0] + '.mask.nii.gz'
-
+        
+        mask_filepath = f"{os.path.dirname(img_filepath)}/".replace('/UTE/', '/MASKS/') + os.path.basename(img_filepath).split('.nii.gz')[0] + '_mask.nii.gz'
+        print(mask_filepath)
         img_filename = os.path.basename(img_filepath).split('.nii.gz')[0]
-        mask_filename = os.path.basename(mask_filepath).split('.mask.nii.gz')[0] if os.path.exists(mask_filepath) else None
+        mask_filename = os.path.basename(mask_filepath).split('_mask.nii.gz')[0] if os.path.exists(mask_filepath) else None
 
         if img_filename == mask_filename:
             filename = img_filename
