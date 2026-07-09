@@ -1,8 +1,14 @@
 import os
 import sys
-import math
 import shutil
+import warnings
 import torch
+
+warnings.filterwarnings(
+    "ignore",
+    message="torch.utils.checkpoint: the use_reentrant parameter should be passed explicitly",
+    category=UserWarning,
+)
 import pandas as pd
 import numpy as np
 from skimage import io, transform
@@ -16,7 +22,10 @@ from monai.inferers import SlidingWindowInferer
 #from monai import metrics
 from datetime import date
 today = date.today()
-from datasets_causality import CausalityDataset, ToTensor, VariableSpatialFix, RandomCrop
+from datasets_causality import (
+    CausalityDataset, ToTensor, VariableSpatialFix, RandomCrop, PadOrCrop,
+    RandomAnisoScale, RandomElastic,
+)
 import torch.nn.functional as F
 import SimpleITK as sitk
 import tqdm
@@ -34,12 +43,13 @@ import torch.nn.parallel
 
 
 #from unet_ute import UNet
-# from swin import SwinUNETR
-from basic_unet_disentagled import BasicUNet
+# from swin import 
+
+from basic_unet_disentangled import BasicUNet
 from gin_with_log_capability import CausalityAugmentation3D
 
 # Local Complexity (LC) tracking during training
-from compute_local_complexity_unet import UNetLocalComplexity
+from compute_local_complexity_unet import UNetLocalComplexity, TARGET_SHAPE as LC_TARGET_SHAPE
 from eval_step_1 import normalise_hu as lc_normalise_hu, normalise_one_one as lc_normalise_one_one
 
 #from unet_2_dec import UNet
@@ -54,6 +64,8 @@ LAMBDA_DIV = 1
 # =====================================================================
 #  Local Complexity (LC) tracking configuration
 # =====================================================================
+COMPUTE_LOCAL_COMPLEXITY_DURING_TRAINING = False  # set True to enable LC eval during training
+
 LC_TRAIN_SCANS_CSV = './ids/only_copd_1.25mm.csv'
 LC_VAL_SCANS_CSV = './ids/only_ute_1.25mm.csv'
 LC_NUM_TRAIN_SCANS = 110
@@ -63,13 +75,13 @@ LC_RADIUS = 0.001
 LC_N_HULL = 10
 LC_HULL_SEED = 42
 LC_HULL_BATCH_SIZE = 1
-LC_MUL_FACTOR = 16                # 2 ** num_of_double_stride_conv (=4)
-LC_PADVAL = 0.5
-LC_LOG_DIR = './log/local_complexity_monitoring_during_training'
+# All LC scans are forced to LC_TARGET_SHAPE inside UNetLocalComplexity.compute()
+# (centre-crop / zero-pad) so the hull-direction cache holds a single entry.
+LC_LOG_DIR = './log/local_complexity_monitoring_during_training_70_RE_80_GIN_instance_norm'
 LC_TRAIN_CSV_PATH = os.path.join(LC_LOG_DIR, 'train_lc.csv')
 LC_TEST_CSV_PATH = os.path.join(LC_LOG_DIR, 'test_lc.csv')
-LC_WEIGHT_SAVE_PATH = './save_models/lc_monitoring/best_bunet_causality_lowest_lc.pth'
-PER_EPOCH_WEIGHT_DIR = './save_models/lc_monitoring'
+LC_WEIGHT_SAVE_PATH = './save_models/lc_monitoring_70_RE_80_GIN_instance_norm/best_bunet_causality_lowest_lc_70_RE_80_GIN_instance_norm.pth'
+PER_EPOCH_WEIGHT_DIR = './save_models/lc_monitoring_70_RE_80_GIN_instance_norm'
 
 # Module-level LC tracking state (persists across epochs within a run)
 global_opt_step = 0
@@ -78,7 +90,7 @@ min_test_avg_total_lc = np.inf
 
 
 def _prepare_lc_input(path, scan_type, device):
-    """Replicate the preprocessing used in compute_local_complexity_unet.py."""
+    """Load and normalise a scan for LC; shape is fixed inside compute()."""
     arr = np.load(path).astype(np.float32)
     img = arr[:, :, :, 0]
 
@@ -87,16 +99,6 @@ def _prepare_lc_input(path, scan_type, device):
     else:
         img = lc_normalise_one_one(lc_normalise_hu(img))
 
-    h, w, d = img.shape
-    new_h = LC_MUL_FACTOR * math.ceil(h / LC_MUL_FACTOR)
-    new_w = LC_MUL_FACTOR * math.ceil(w / LC_MUL_FACTOR)
-    new_d = LC_MUL_FACTOR * math.ceil(d / LC_MUL_FACTOR)
-    img = np.pad(
-        img,
-        ((0, new_h - h), (0, new_w - w), (0, new_d - d)),
-        'constant',
-        constant_values=LC_PADVAL,
-    )
     tensor = torch.from_numpy(img).unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
     return tensor.to(device)
 
@@ -123,6 +125,7 @@ def _compute_avg_lc(lc_helper, paths, scan_type, device):
             n_hull=LC_N_HULL,
             seed=LC_HULL_SEED,
             hull_batch_size=LC_HULL_BATCH_SIZE,
+            target_shape=LC_TARGET_SHAPE,
         )
         total_sum += float(r['total_lc'])
         for name in layer_names:
@@ -359,7 +362,7 @@ def train(dataloader, model, optimizer, epoch, bce_criterion, dice_criterion, au
     model.train()
     augmentor.eval()
 
-    log_csv_path = './log/augmentation_weights_log_td1_roughness_enforced_lc_monitor.csv'
+    log_csv_path = './log/augmentation_weights_log_td1_lc_monitor_70_RE_80_GIN_instance_norm_new_aug_only_elastic.csv'
     if not os.path.exists('./log'):
         os.makedirs('./log')
 
@@ -489,7 +492,8 @@ def train(dataloader, model, optimizer, epoch, bce_criterion, dice_criterion, au
         # ------------------------------------------------------------------
         global global_opt_step
         global_opt_step += 1
-        if (lc_helper is not None and lc_train_paths is not None and lc_val_paths is not None
+        if (COMPUTE_LOCAL_COMPLEXITY_DURING_TRAINING
+                and lc_helper is not None and lc_train_paths is not None and lc_val_paths is not None
                 and global_opt_step % LC_INTERVAL == 0):
             was_training = model.training
             _run_lc_eval_and_maybe_save(
@@ -573,8 +577,8 @@ def test(dataloader, model, epoch, bce_criterion, dice_criterion, df, scheduler=
     #     cval=0.0                    # Constant value for padding
     # )
     
-    log_csv_path = './log/augmentation_weights_log_td1_roughness_enforced_lc_monitor.csv'
-    save_on_best_test_log_csv_path = './log/augmentation_weights_log_td1_roughness_enforced_lc_monitor_saved_on_best_test.csv'
+    log_csv_path = './log/augmentation_weights_log_td1_lc_monitor_70_RE_80_GIN_instance_norm_new_aug_only_elastic.csv'
+    save_on_best_test_log_csv_path = './log/augmentation_weights_log_td1_lc_monitor_70_RE_80_GIN_instance_norm_new_aug_only_elastic_saved_on_best_test.csv'
 
     with torch.no_grad():
         for X, y, _ in dataloader:
@@ -638,7 +642,7 @@ def test(dataloader, model, epoch, bce_criterion, dice_criterion, df, scheduler=
             #print(f"\nTargeted IOU improved from {global_target_iou} to {target_iou} . Saving the current weight\n\n\n\n\n")
             global_loss = val_loss
             epoch_since_loss_didnt_improve=0
-            torch.save(model.state_dict(), './save_models/'+ 'best_bunet_roughness_enforced_td1_lc_monitor.pth')
+            torch.save(model.state_dict(), './save_models/'+ 'best_bunet_td1_lc_monitor_70_RE_80_GIN_instance_norm_new_aug_only_elastic.pth')
             print("Model saved successfully")
             if os.path.exists(log_csv_path):
                 shutil.copy(log_csv_path, save_on_best_test_log_csv_path)
@@ -646,6 +650,28 @@ def test(dataloader, model, epoch, bce_criterion, dice_criterion, df, scheduler=
         else:
             epoch_since_loss_didnt_improve += 1
 
+
+
+def _seed_worker(worker_id):
+    """Give each DataLoader worker its own NumPy RNG state.
+
+    PyTorch reseeds ``torch`` and Python's ``random`` per worker automatically,
+    but NOT NumPy's global RNG. The augmentations here lean on ``np.random``
+    (e.g. the per-sample probability checks and RandomAnisoScale's scale draw),
+    so without this every worker would fork the same NumPy state and emit
+    identical "random" augmentations. Derive a distinct per-worker seed from the
+    base seed PyTorch already set for this worker.
+    """
+    base_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed((base_seed + worker_id) % (2 ** 32))
+
+
+# Number of background processes used to load + augment batches. The heavy
+# RandomAnisoScale / RandomElastic warps run on the CPU; with 0 workers they run
+# serially in the main process and the GPU stalls waiting for each batch. Using
+# several workers overlaps that augmentation with GPU compute and parallelises it
+# across cores. Tune to the node's available CPU cores.
+NUM_DATALOADER_WORKERS = 8
 
 
 def main():
@@ -656,8 +682,18 @@ def main():
     training_data = CausalityDataset(csv_file='./ids/only_copd_1.25mm.csv', #causality_train_ute_copd.csv',#only_copd_1.25mm.csv`',   
                                transform = transforms.Compose(
                                 [
-                                    #RandomCrop(output_size=(192, 192, 96), padval=0.5), 
-                                    VariableSpatialFix(num_of_double_stride_conv=4),
+                                    #RandomCrop(output_size=(192, 192, 96), padval=0.5),
+                                    # Geometric augmentation (paired image+mask) BEFORE GIN.
+                                    # Aniso scale runs on the native grid; elastic runs
+                                    # after the size-fix on the padded grid. Both at 50%.
+                                    #RandomAnisoScale(prob=0.5, scale_range=(0.80, 1.25)),
+                                    # Force every training scan to 256^3 (center crop / pad)
+                                    # to match the isotropic 256^3 test data and bound the
+                                    # FP32 activation memory (fixes CUDA OOM). Image padded
+                                    # with -1 (background), mask with 0.
+                                    PadOrCrop(output_size=(256, 256, 256), image_padval=-1, mask_padval=0),
+                                    # VariableSpatialFix(num_of_double_stride_conv=4),
+                                    RandomElastic(prob=0.5, alpha=12.0, ctrl=8),
                                     ToTensor()
                                 ]),
                                training = True,
@@ -693,20 +729,38 @@ def main():
 
     scaler = None #torch.cuda.amp.GradScaler()
 
-    train_dataloader = DataLoader(training_data, batch_size=batch_size, shuffle=True)
-    test_dataloader = DataLoader(test_data, batch_size=batch_size, shuffle=False)
+    train_dataloader = DataLoader(
+        training_data,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=NUM_DATALOADER_WORKERS,
+        pin_memory=True,
+        persistent_workers=NUM_DATALOADER_WORKERS > 0,
+        prefetch_factor=2 if NUM_DATALOADER_WORKERS > 0 else None,
+        worker_init_fn=_seed_worker,
+    )
+    test_dataloader = DataLoader(
+        test_data,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=NUM_DATALOADER_WORKERS,
+        pin_memory=True,
+        persistent_workers=NUM_DATALOADER_WORKERS > 0,
+        prefetch_factor=2 if NUM_DATALOADER_WORKERS > 0 else None,
+        worker_init_fn=_seed_worker,
+    )
     print('data loaded')
 
 
 
-    optimizer = torch.optim.Adam(gen.parameters(), lr = 1e-3)#(param_groups) #(gen.parameters(), lr = 1e-4)
+    optimizer = torch.optim.Adam(gen.parameters(), lr = 1e-4)#(param_groups) #(gen.parameters(), lr = 1e-4)
 
     scheduler = None #ReduceLROnPlateau(optimizer, mode='min', patience=300, factor=0.1)
     
     print('training data')
     
 
-    epochs = 500
+    epochs = 2000
     df_train = pd.DataFrame(columns=['epoch','loss'])
     df_test = pd.DataFrame(columns=['epoch','loss','IOU','precision'])
 
@@ -717,13 +771,18 @@ def main():
     augmentor = CausalityAugmentation3D(in_channels=1).to(device)
 
     # ---- Local Complexity (LC) evaluation setup ----
-    os.makedirs(LC_LOG_DIR, exist_ok=True)
-    os.makedirs(PER_EPOCH_WEIGHT_DIR, exist_ok=True)
-    lc_train_paths = pd.read_csv(LC_TRAIN_SCANS_CSV)['filepaths'].tolist()[:LC_NUM_TRAIN_SCANS]
-    lc_val_paths = pd.read_csv(LC_VAL_SCANS_CSV)['filepaths'].tolist()
-    lc_helper = UNetLocalComplexity(gen, device=device, target_layers="all")
-    print(f"[LC] Tracking LC on {len(lc_train_paths)} train scans and {len(lc_val_paths)} val scans "
-          f"every {LC_INTERVAL} opt steps; saving LC-best weight after step {LC_WEIGHT_START_STEP}.")
+    if COMPUTE_LOCAL_COMPLEXITY_DURING_TRAINING:
+        os.makedirs(LC_LOG_DIR, exist_ok=True)
+        os.makedirs(PER_EPOCH_WEIGHT_DIR, exist_ok=True)
+        lc_train_paths = pd.read_csv(LC_TRAIN_SCANS_CSV)['filepaths'].tolist()[:LC_NUM_TRAIN_SCANS]
+        lc_val_paths = pd.read_csv(LC_VAL_SCANS_CSV)['filepaths'].tolist()
+        lc_helper = UNetLocalComplexity(gen, device=device, target_layers="all", hook_target="norm")
+        print(f"[LC] Tracking LC on {len(lc_train_paths)} train scans and {len(lc_val_paths)} val scans "
+              f"every {LC_INTERVAL} opt steps (target shape {LC_TARGET_SHAPE}); "
+              f"saving LC-best weight after step {LC_WEIGHT_START_STEP}.")
+    else:
+        lc_helper = lc_train_paths = lc_val_paths = None
+        print("[LC] Disabled (COMPUTE_LOCAL_COMPLEXITY_DURING_TRAINING=False).")
 
     for t in range(epochs):
 
@@ -734,16 +793,17 @@ def main():
 
         test(test_dataloader, gen, t, bce_criterion, dice_criterion, df_test, scheduler) # 
 
-        # ---- Per-epoch weight snapshot (always saved, regardless of loss/LC) ----
-        per_epoch_path = os.path.join(PER_EPOCH_WEIGHT_DIR, f'latest_epoch_bunet_causality.pth')
-        torch.save(gen.state_dict(), per_epoch_path)
-        print(f"[per-epoch] saved weight to {per_epoch_path}")
+        if COMPUTE_LOCAL_COMPLEXITY_DURING_TRAINING:    
+            # ---- Per-epoch weight snapshot (always saved, regardless of loss/LC) ----
+            per_epoch_path = os.path.join(PER_EPOCH_WEIGHT_DIR, f'latest_epoch_bunet_causality_70_RE_80_GIN_instance_norm.pth')
+            torch.save(gen.state_dict(), per_epoch_path)
+            print(f"[per-epoch] saved weight to {per_epoch_path}")
         
         # df_train.at[t, 'lr'] = optimizer.param_groups[0]['lr']
         # df_test.at[t, 'lr'] = optimizer.param_groups[0]['lr']
         
-        df_train.to_csv('./log/train_metrics_' + net + '_roughness_enforced_gin_td1_with_lc_monitoring.csv', index=False)
-        df_test.to_csv('./log/test_metrics_' + net + '_roughness_enforced_gin_td1_with_lc_monitoring.csv', index=False)
+        df_train.to_csv('./log/train_metrics_' + net + '_td1_lc_monitor_70_RE_80_GIN_instance_norm_new_aug_only_elastic.csv', index=False)
+        df_test.to_csv('./log/test_metrics_' + net + '_td1_lc_monitor_70_RE_80_GIN_instance_norm_new_aug_only_elastic.csv', index=False)
         
         sys.stdout.flush()
 
@@ -759,8 +819,20 @@ def main():
 
 if __name__=="__main__":
 
+    # -----------------------------------------------------------------
+    # Force full FP32 math on the A100. By default PyTorch lets cuDNN
+    # convolutions (and, on some versions, cuBLAS matmuls) silently run in
+    # TF32, which truncates the mantissa to 10 bits. Disabling these makes
+    # every conv/matmul use the full 23-bit FP32 mantissa for better
+    # numerical precision (at the cost of throughput). Training itself is
+    # already non-AMP (scaler=None), so this closes the only TF32 path.
+    # -----------------------------------------------------------------
+    # torch.backends.cuda.matmul.allow_tf32 = False
+    # torch.backends.cudnn.allow_tf32 = False
+    # torch.set_float32_matmul_precision("highest")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     main()
 
 

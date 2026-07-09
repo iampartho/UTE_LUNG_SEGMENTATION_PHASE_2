@@ -67,10 +67,10 @@ def main():
     csv = args.csv
     #outdir = args.outdir
 
-    all_img_file_dir = glob.glob('/Shared/lss_segerard/data/UTE_MRI_ILD/UTE/*.nii.gz')
+    all_img_file_dir = glob.glob('/Shared/lss_segerard/data/UTE_MRI_OECLAD/UTE/*.nii.gz')
     #all_mask_file_dir = glob.glob('/Shared/lss_segerard/data/COPDGene-RV-FRC/*/pass/*.nii.gz')
 
-    output_dir = '/Shared/lss_segerard/parthghosh/data/UTE_MRI_ILD_ORIGINAL_SPACING_WITH_MASK_TOTALSEGMENTOR_resampled_1.25mm'
+    output_dir = '/Shared/lss_segerard/parthghosh/data/UTE_MRI_OECLAD_ORIGINAL_SPACING_resampled_1.25mm_only_img'
     os.makedirs(output_dir, exist_ok=True)
     for idx in tqdm.tqdm(range(len(all_img_file_dir))):
 
@@ -79,20 +79,20 @@ def main():
         mask_filepath = f"{os.path.dirname(img_filepath)}/".replace('/UTE/', '/MASKS/') + os.path.basename(img_filepath).split('.nii.gz')[0] + '_mask.nii.gz'
         print(mask_filepath)
         img_filename = os.path.basename(img_filepath).split('.nii.gz')[0]
-        mask_filename = os.path.basename(mask_filepath).split('_mask.nii.gz')[0] if os.path.exists(mask_filepath) else None
+        # mask_filename = os.path.basename(mask_filepath).split('_mask.nii.gz')[0] if os.path.exists(mask_filepath) else None
 
-        if img_filename == mask_filename:
-            filename = img_filename
-        else:
-            print("The image filename and mask filename did not match, ", img_filename, '   ', mask_filename, ' try again')
-            break
+        # if img_filename == mask_filename:
+        #     filename = img_filename
+        # else:
+        #     print("The image filename and mask filename did not match, ", img_filename, '   ', mask_filename, ' try again')
+        #     break
 
 
         
         
         print(img_filepath, mask_filepath)
         img = sitk.ReadImage(img_filepath) # reading the original nifti file (ct image volume)
-        airway = sitk.ReadImage(mask_filepath) # reading the ground truth of the image file 
+        # airway = sitk.ReadImage(mask_filepath) # reading the ground truth of the image file 
 
 
         dirs = img.GetDirection() # it returns a 3x3 matrix to denote if the image is rotated or sheered correspond to the patient body axes, a identity matrix represent no rotation
@@ -102,24 +102,25 @@ def main():
         flips = [False if x==1 else True for x in dirs_diag] # to make sure if there is any flipping in any of the axes
         print(flips)
         img = sitk.Flip(img, flips) # if there was any flipping then fix the flipping on img, ground truth and on the lungs lobe segmentation
-        airway = sitk.Flip(airway, flips)
+        # airway = sitk.Flip(airway, flips)
 
         img_resample = resample_iso(img, 1.25, 0, sitk.sitkBSpline) # resample the images so that the spacing is 1 in all axes and -1024 to use for pixels outside the input image bounds after resampling.
-        airway_resample = resample_ref(airway, img_resample, 0, sitk.sitkNearestNeighbor) # sitk.sitkBSpline) # since the image is resamples so the gt and lobe segmentation is also required to be resampled
+        # airway_resample = resample_ref(airway, img_resample, 0, sitk.sitkNearestNeighbor) # sitk.sitkBSpline) # since the image is resamples so the gt and lobe segmentation is also required to be resampled
         
         img_np = sitk.GetArrayFromImage(img_resample) # converting the image, gt and lung lobe to numpy array
         #img_np = improve_contrast(img_np)
-        airway_np = sitk.GetArrayFromImage(airway_resample)
-        airway_np[airway_np > 0] = 1
+        # airway_np = sitk.GetArrayFromImage(airway_resample)
+        # airway_np[airway_np > 0] = 1
 
 
 
-        sample = np.stack((img_np, airway_np), axis=-1) # stacking the ct image volume and the mask together in a new axis basically if the image is for example is (320,300,300) then gt will be the same and after stacking the resulting array will be (320,300,300,2)
-        print(sample.shape)
+        # sample = np.stack((img_np, airway_np), axis=-1) # stacking the ct image volume and the mask together in a new axis basically if the image is for example is (320,300,300) then gt will be the same and after stacking the resulting array will be (320,300,300,2)
+        # print(sample.shape)
         #np.save("test.npy", sample)
-        outfn = f"{output_dir}/{filename}"
+        outfn = f"{output_dir}/{img_filename}"
         print(outfn)
-        np.save(outfn, sample)
+        # np.save(outfn, sample)
+        np.save(outfn, img_np)
 
     #crop_margin = get_lung_inds(masknp)
     #ct_np = unpad(ct_np, crop_margin)

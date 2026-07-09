@@ -13,7 +13,7 @@ from skimage.morphology import binary_erosion, binary_opening
 from monai.inferers import SlidingWindowInferer
 #from monai.networks.nets import UNETR
 
-from basic_unet_disentagled import BasicUNet
+from basic_unet_disentangled import BasicUNet
 from learnable_gin import LearnableGIN3D
 # from swin import SwinUNETR
 import glob
@@ -232,9 +232,16 @@ def model_ct_wrapper(x):
 # test_df = pd.concat([test_df1, test_df2])
 
 if __name__ == "__main__":
-    test_df = pd.read_csv('./ids/UTE_MRI_ILD_WITH_MASK_TOTALSEGMENTOR_resampled_1.25mm.csv') #pd.read_csv('./ids/UTE_MRI_previous_numpy.csv') #pd.read_csv('./ids/causality_test_ute_copd.csv')
+    test_df = pd.read_csv('./ids/only_ute_1.25mm.csv') #UTE_MRI_previous_numpy.csv') #pd.read_csv('./ids/UTE_MRI_previous_numpy.csv') #pd.read_csv('./ids/causality_test_ute_copd.csv')
 
-    all_files = test_df['filepaths'].values
+    target_path = '/Shared/lss_segerard/parthghosh/data/UTE_previous_data_numpy_without_clipping/001-20151218-BC.npy'
+    target_path2 = '/Shared/lss_segerard/parthghosh/data/UTE_previous_data_numpy_without_clipping/004-20160112-BC.npy'
+    target_path3 = '/Shared/lss_segerard/parthghosh/data/UTE_previous_data_numpy_without_clipping/007-20160314-BC.npy'
+
+    all_files = [target_path, target_path2, target_path3]
+    # all_files = test_df[test_df['filepaths']]['filepaths'].values[59:60]
+    print(all_files)
+    
     # all_files = test_df['filepaths'].values
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -242,7 +249,7 @@ if __name__ == "__main__":
     model = BasicUNet().to(device)
 
 
-    checkpoint = './save_models/best_bunet_causality_paper_ct_train_UTE_test_w_tversky_wo_kl.pth'
+    checkpoint = './save_models/best_unet_td1.pth'
 
     # checkpoint_gin = './save_models/best_augmentor_learnable_gin_mode_4.pth'
 
@@ -252,7 +259,19 @@ if __name__ == "__main__":
 
 
     if checkpoint:
-        model.load_state_dict(torch.load(checkpoint, map_location=device.type))
+        state_dict = torch.load(checkpoint, map_location=device.type)
+        # Older checkpoints (from the disentangled BasicUNet variant) carry an
+        # extra parallel set of `*_ct` normalisation layers that the current
+        # `basic_unet_disentangled_no_normalising.BasicUNet` no longer defines.
+        # `strict=False` lets us load every matching tensor and just drop the
+        # unused `_ct` ones. We log what was skipped so silent drift is visible.
+        load_result = model.load_state_dict(state_dict, strict=False)
+        if load_result.missing_keys:
+            print(f"[load_state_dict] missing keys ({len(load_result.missing_keys)}): "
+                  f"{load_result.missing_keys[:8]}{' ...' if len(load_result.missing_keys) > 8 else ''}")
+        if load_result.unexpected_keys:
+            print(f"[load_state_dict] ignored unexpected keys ({len(load_result.unexpected_keys)}): "
+                  f"{load_result.unexpected_keys[:8]}{' ...' if len(load_result.unexpected_keys) > 8 else ''}")
 
     transform = transforms.Compose(
                                     [
@@ -318,7 +337,9 @@ if __name__ == "__main__":
         #print(img_tensor.shape)
 
         with torch.no_grad():
-            filename = f"{os.path.basename(each_file).split('.npy')[0]}_UTE_{idx}.npy"
+            
+            filename = f"{'_'.join(each_file.split('/')[-4:])}".split('.npy')[0]
+
             # if 'UTE' in each_file:
             #     filename = f"{os.path.basename(each_file).split('.npy')[0]}_UTE_{idx}.npy"
             #     pred = sliding_window_inferer(img_tensor, model_ute_wrapper)
@@ -339,8 +360,8 @@ if __name__ == "__main__":
 
             pred_np = pred.detach().squeeze().cpu().numpy().astype(np.uint8)
             # pred_np = pred_np[:h, :w, :d]
-            generate_nifty(img_np, (1,1,1), f"{output_nifty_dir}/{filename.split('.npy')[0]}_input_op.nii.gz")
-            generate_nifty(pred_np, (1,1,1), f"{output_nifty_dir}/{filename.split('.npy')[0]}_pred.nii.gz")
-            generate_nifty(gt_tensor.squeeze().cpu().numpy(), (1,1,1), f"{output_nifty_dir}/{filename.split('.npy')[0]}_gt.nii.gz")
+            # generate_nifty(img_np, (1,1,1), f"{output_nifty_dir}/{filename.split('.npy')[0]}_input_op.nii.gz")
+            generate_nifty(pred_np, (1.25,1.25,1.25), f"{output_nifty_dir}/{filename}_pred.nii.gz")
+            generate_nifty(gt_tensor.squeeze().cpu().numpy(), (1.25,1.25,1.25), f"{output_nifty_dir}/{filename}_gt.nii.gz")
 
-            generate_confusion_mask(f"{output_nifty_dir}/{filename.split('.npy')[0]}_gt.nii.gz", f"{output_nifty_dir}/{filename.split('.npy')[0]}_pred.nii.gz", f"{output_nifty_dir}/{filename.split('.npy')[0]}_confusion_unet.nii.gz")
+            # generate_confusion_mask(f"{output_nifty_dir}/{filename.split('.npy')[0]}_gt.nii.gz", f"{output_nifty_dir}/{filename.split('.npy')[0]}_pred.nii.gz", f"{output_nifty_dir}/{filename.split('.npy')[0]}_confusion_unet.nii.gz")

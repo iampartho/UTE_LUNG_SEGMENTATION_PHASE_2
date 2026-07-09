@@ -148,7 +148,7 @@ class GradlessGCReplayNonlinBlock3D(nn.Module):
         nb, nc, nx, ny, nz = x_in.shape
         device = x_in.device
 
-        is_high_roughness = torch.rand(1).item() > 0.22 # 
+        is_high_roughness = torch.rand(1).item() > 0.3 # 
         
 
         # Generate the tuned kernel

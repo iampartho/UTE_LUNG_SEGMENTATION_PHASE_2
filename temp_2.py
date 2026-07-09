@@ -1,161 +1,216 @@
-import pandas as pd
-import matplotlib.pyplot as plt
-# # Load the results csv
+"""
+temp_2.py — Generate GIN-augmented copies of every .npy scan in a directory.
 
-# df = pd.read_csv("./test_result_csv/td1_roughness_enforced_5_normalised_gin_prev_data.csv")
+For each input .npy:
+  1. Load (handles 4D npy of shape (D, H, W, [img, gt]) by taking channel 0).
+  2. Normalise to [-1, 1] (HU clipping first if SCAN_TYPE == "CT").
+  3. Run GIN3D from `gin_with_log_capability.py` ``N_INSTANCES`` times.
+  4. Tag each run with a per-layer roughness label, e.g. "L-L-H-H", using the
+     same FFT-based criterion as `kernel_combination_distribution_for_gin.py`
+     (L = low roughness, < threshold; H = high, >= threshold).
+  5. Save augmented images as
+        <stem>_[L-H-L-H].nii.gz
+     Duplicate combos within the same scan get an underscore suffix
+     (`_2`, `_3`, …) so nothing is overwritten.
 
-# # Sort the csv by the iou column
-# df = df.sort_values(by='iou', ascending=False)
+Note: GIN3D inside `gin_with_log_capability.py` actively biases its random
+kernels toward high (~65%) or low (~35%) roughness per layer, so the 8 runs
+are *not* guaranteed to hit 8 distinct combos out of the 16 possible — that
+is by design (matches the trained distribution).  If you want exactly one of
+each combo, switch to the unbiased GIN3D in `causality_paper_augmentation_2.py`.
+"""
 
-# # select rows by jumping every 5 rows
-# # df = df.iloc[:45]
-
-# # get the filepaths and iou values
-# filepaths = df["sid"].tolist()
-# iou_values = df["iou"].tolist()
-
-# # extract the index number from the filepaths
-# index_numbers = [int(filepath.split('/')[-1].split('_')[-1]) for filepath in filepaths]
-
-# # Get the original UTE filepaths from the original UTE csv
-# ute_df = pd.read_csv("./ids/UTE_MRI_previous_numpy_without_clipping.csv")
-# ute_filepaths = ute_df["filepaths"].tolist()
-
-# # Based on the index numbers, get the corresponding UTE filepaths
-# ute_filepaths = [ute_filepaths[index] for index in index_numbers]
-
-# # Now based on the ute filepaths, get the corresponding total_lc from the log_local_complexity
-
-# csv_paths = [f"./log_local_complexity/roughness_enforced_td1_app_5/roughness_enforced_model_UTE_MRI_previous_data/{'-'.join(scan_path.split('/')[1:])[:-4]}.csv" for scan_path in ute_filepaths]
-# lc_dfs = [pd.read_csv(csv_path, comment='#', skip_blank_lines=True) for csv_path in csv_paths]
-
-# layer_columns = [
-#     "total_lc",
-#     "enc_0_0", "enc_0_1", "enc_1_0", "enc_1_1",
-#     "enc_2_0", "enc_2_1", "enc_3_0", "enc_3_1",
-#     "dec_4_0", "dec_4_1", "dec_3_0", "dec_3_1",
-#     "dec_2_0", "dec_2_1",
-# ]
-
-# n_cols = 3
-# n_rows = (len(layer_columns) + n_cols - 1) // n_cols
-# fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
-# axes = axes.flatten()
-
-# for i, col in enumerate(layer_columns):
-#     lc_values = [lc_df[col].iloc[-1] for lc_df in lc_dfs]
-#     axes[i].scatter(lc_values, iou_values, s=10)
-#     axes[i].set_xlabel(f"{col} LC")
-#     axes[i].set_ylabel("IOU")
-#     axes[i].set_title(f"{col} LC vs IOU")
-
-# for j in range(len(layer_columns), len(axes)):
-#     axes[j].set_visible(False)
-
-# fig.tight_layout()
-# fig.savefig("./log_local_complexity/all_lc_vs_iou_for_all_scans_previous_data.png", dpi=150)
-# plt.close(fig)
-# print("Saved combined scatter plot")
-
-# Histogram of LC values across ALL csv files in the folder
 import glob
-# all_csv_paths = sorted(glob.glob("./log_local_complexity/roughness_enforced_td1_app_5/roughness_enforced_model_UTE_MRI_previous_data/*.csv"))
-# all_lc_dfs = [pd.read_csv(p, comment='#', skip_blank_lines=True) for p in all_csv_paths]
+import os
 
-# layer_columns = [
-#     "total_lc",
-#     "enc_0_0", "enc_0_1", "enc_1_0", "enc_1_1",
-#     "enc_2_0", "enc_2_1", "enc_3_0", "enc_3_1",
-#     "dec_4_0", "dec_4_1", "dec_3_0", "dec_3_1",
-#     "dec_2_0", "dec_2_1",
-# ]
-
-# n_cols = 3
-# n_rows = (len(layer_columns) + n_cols - 1) // n_cols
-
-# fig_hist, axes_hist = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
-# axes_hist = axes_hist.flatten()
-
-# for i, col in enumerate(layer_columns):
-#     values = [lc_df[col].iloc[-1] for lc_df in all_lc_dfs]
-#     axes_hist[i].hist(values, bins=20, edgecolor='black')
-#     axes_hist[i].set_xlabel(f"{col} LC")
-#     axes_hist[i].set_ylabel("Count")
-#     axes_hist[i].set_title(f"Distribution of {col}")
-
-# for j in range(len(layer_columns), len(axes_hist)):
-#     axes_hist[j].set_visible(False)
-
-# fig_hist.tight_layout()
-# fig_hist.savefig("./log_local_complexity/all_lc_causality_paper_model_histograms_UTE_MRI_previous_data.png", dpi=150)
-# plt.close(fig_hist)
-# print("Saved combined histogram plot")
-
-# Overlapping histograms: UTE vs CT with histogram intersection
+import SimpleITK as sitk
 import numpy as np
+import torch
+from scipy.fftpack import fftn
 
-ute_csv_paths = sorted(glob.glob("./log_local_complexity/roughness_enforced_td1_app_5/roughness_enforced_model_UTE_MRI_previous_data/*.csv"))
-ct_csv_paths = sorted(glob.glob("./log_local_complexity/roughness_enforced_td1_app_5/roughness_enforced_latest_model_COPD_CT_110/*.csv"))
+from gin_with_log_capability import GIN3D
 
-ute_lc_dfs = [pd.read_csv(p, comment='#', skip_blank_lines=True) for p in ute_csv_paths]
-ct_lc_dfs = [pd.read_csv(p, comment='#', skip_blank_lines=True) for p in ct_csv_paths]
 
-layer_columns = [
-    "total_lc",
-    "enc_0_0", "enc_0_1", "enc_1_0", "enc_1_1",
-    "enc_2_0", "enc_2_1", "enc_3_0", "enc_3_1",
-    "dec_4_0", "dec_4_1", "dec_3_0", "dec_3_1",
-    "dec_2_0", "dec_2_1",
-]
+# =====================================================================
+#  CONFIG  — edit these before running
+# =====================================================================
 
-n_cols = 3
-n_rows = (len(layer_columns) + n_cols - 1) // n_cols
+INPUT_DIR   = "/Shared/lss_segerard/parthghosh/data/COPDgene_CT_1.25mm_numpy"
+OUTPUT_DIR  = "./gin_augmented"
 
-fig_overlap, axes_overlap = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
-axes_overlap = axes_overlap.flatten()
+SCAN_TYPE   = "CT"               # "UTE" or "CT"  (CT applies HU clipping first)
+N_INSTANCES = 8
 
-n_bins = 30
+# GIN3D architecture — must match what was used at training time.
+GIN_KW = dict(
+    in_channel=1,
+    out_channel=1,
+    interm_channel=4,
+    scale_pool=[1, 2, 3],
+    n_layer=4,
+    out_norm="frob",
+)
 
-for i, col in enumerate(layer_columns):
-    ute_vals = np.array([lc_df[col].iloc[-1] for lc_df in ute_lc_dfs])
-    ct_vals = np.array([lc_df[col].iloc[-1] for lc_df in ct_lc_dfs])
+# Per-layer roughness threshold (matches kernel_combination_distribution_for_gin.py).
+ROUGHNESS_THRESHOLD = 0.5
 
-    bin_min = min(ute_vals.min(), ct_vals.min())
-    bin_max = max(ute_vals.max(), ct_vals.max())
-    bins = np.linspace(bin_min, bin_max, n_bins + 1)
+# Output NIfTI metadata (npy files have no header, so we set this manually).
+OUTPUT_SPACING_MM = (1.0, 1.0, 1.0)   # SimpleITK order: (x, y, z)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SEED = 0                              # set to None for non-deterministic runs
 
-    ute_hist, _ = np.histogram(ute_vals, bins=bins)
-    ct_hist, _ = np.histogram(ct_vals, bins=bins)
 
-    ute_norm = ute_hist / ute_hist.sum()
-    ct_norm = ct_hist / ct_hist.sum()
-    intersection = np.sum(np.minimum(ute_norm, ct_norm))
+# =====================================================================
+#  Image utilities
+# =====================================================================
 
-    eps = 1e-10
-    ute_smooth = ute_norm + eps
-    ct_smooth = ct_norm + eps
-    kl_div = 0.5 * (np.sum(ute_smooth * np.log(ute_smooth / ct_smooth)) +
-                     np.sum(ct_smooth * np.log(ct_smooth / ute_smooth)))
+def normalise_zero_one(x):
+    mn, mx = float(x.min()), float(x.max())
+    if mx > mn:
+        return (x - mn) / (mx - mn)
+    return x * 0.0
 
-    axes_overlap[i].hist(ute_vals, bins=bins, alpha=0.5, label='UTE', edgecolor='black')
-    axes_overlap[i].hist(ct_vals, bins=bins, alpha=0.5, label='CT', edgecolor='black')
-    axes_overlap[i].set_xlabel(f"{col} LC")
-    axes_overlap[i].set_ylabel("Count")
-    axes_overlap[i].set_title(f"{col}")
-    axes_overlap[i].tick_params(axis='x', rotation=45)
-    axes_overlap[i].legend(fontsize=8, loc='upper right')
-    axes_overlap[i].text(
-        0.95, 0.55, f"Intersect: {intersection:.3f}\nKL Div: {kl_div:.3f}",
-        transform=axes_overlap[i].transAxes,
-        fontsize=8, verticalalignment='top', horizontalalignment='right',
-        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+
+def normalise_one_one(x):
+    return normalise_zero_one(x) * 2.0 - 1.0
+
+
+def normalise_hu(x, lo=-1024.0, hi=600.0):
+    return np.clip(x, lo, hi)
+
+
+def load_image(path):
+    arr = np.load(path).astype(np.float32)
+    if arr.ndim == 4:
+        # Convention in this repo: (D, H, W, [img, gt]) — keep image only.
+        arr = arr[..., 0]
+    if arr.ndim != 3:
+        raise ValueError(
+            f"{path} has shape {arr.shape}; expected 3D or 4D-with-2-channels."
+        )
+    return arr
+
+
+def save_nifti(arr_zyx, out_path, spacing_xyz=(1.0, 1.0, 1.0)):
+    img = sitk.GetImageFromArray(arr_zyx.astype(np.float32))   # expects (z, y, x)
+    img.SetSpacing(tuple(float(s) for s in spacing_xyz))
+    sitk.WriteImage(img, out_path, useCompression=True)
+
+
+# =====================================================================
+#  Roughness classification (mirrors kernel_combination_distribution_for_gin.py)
+# =====================================================================
+
+def _channels_for_layer(layer_idx, n_layer, in_ch, out_ch, interm):
+    """Number of (Out * In) channels per layer in GIN3D."""
+    if layer_idx == 0:
+        return interm * in_ch                # input layer
+    if layer_idx == n_layer - 1:
+        return out_ch * interm               # output layer
+    return interm * interm                   # hidden layer
+
+
+def compute_roughness(kernel_tensor, layer_idx):
+    """High-frequency energy ratio of a stored kernel.
+
+    `kernel_tensor` is the per-layer kernel cached by GIN3D — shape
+    [Batch*Out, In, k, k, k].  Mean over the (Out, In) axes gives a single
+    representative spatial kernel of shape (k, k, k); the 3D FFT magnitude
+    is then split into DC vs. AC energy.
+
+    Returns a scalar in [0, 1):
+        ~0.0 → smooth (low frequency dominates)
+        ~1.0 → rough  (high frequency dominates)
+    """
+    flat = kernel_tensor.detach().cpu().numpy().reshape(-1)
+    channels = _channels_for_layer(
+        layer_idx,
+        n_layer=GIN_KW["n_layer"],
+        in_ch=GIN_KW["in_channel"],
+        out_ch=GIN_KW["out_channel"],
+        interm=GIN_KW["interm_channel"],
     )
+    n_params = flat.size
+    vol = n_params / channels
+    k = int(round(vol ** (1.0 / 3.0)))
+    if k < 2:
+        return 0.0
 
-for j in range(len(layer_columns), len(axes_overlap)):
-    axes_overlap[j].set_visible(False)
+    w = flat.reshape(channels, k, k, k)
+    w_spatial = w.mean(axis=0)
+    fft_mag = np.abs(fftn(w_spatial))
+    total = float(fft_mag.sum())
+    dc = float(fft_mag[0, 0, 0])
+    return 1.0 - dc / (total + 1e-9)
 
-fig_overlap.suptitle("UTE vs CT Local Complexity Distribution Overlap", fontsize=14, y=1.01)
-fig_overlap.tight_layout()
-fig_overlap.savefig("./log_local_complexity/previous_ute_vs_ct_lc_histogram_overlap.png", dpi=150, bbox_inches='tight')
-plt.close(fig_overlap)
-print("Saved UTE vs CT overlapping histogram plot")
+
+def classify_roughness(r, threshold=ROUGHNESS_THRESHOLD):
+    return "L" if r < threshold else "H"
+
+
+# =====================================================================
+#  Main
+# =====================================================================
+
+@torch.no_grad()
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    if SEED is not None:
+        torch.manual_seed(SEED)
+        np.random.seed(SEED)
+
+    paths = sorted(glob.glob(os.path.join(INPUT_DIR, "*.npy")))[0:1]
+    print(f"Found {len(paths)} .npy files in {INPUT_DIR}")
+
+    gin = GIN3D(**GIN_KW).to(DEVICE)
+    gin.eval()
+
+    for i, p in enumerate(paths, 1):
+        stem = os.path.splitext(os.path.basename(p))[0]
+        try:
+            img_np = load_image(p)
+        except Exception as e:                                # noqa: BLE001
+            print(f"[{i}/{len(paths)}] FAILED to load {stem}: {e}")
+            continue
+
+        if SCAN_TYPE.upper() == "CT":
+            img_np = normalise_one_one(normalise_hu(img_np))
+        else:
+            img_np = normalise_one_one(img_np)
+
+        x = (
+            torch.from_numpy(img_np)
+            .unsqueeze(0)        # (1, D, H, W)
+            .unsqueeze(0)        # (1, 1, D, H, W)
+            .to(DEVICE)
+        )
+
+        combo_count = {}
+        for _ in range(N_INSTANCES):
+            x_aug = gin(x)                                    # (1, 1, D, H, W)
+
+            classes = [
+                classify_roughness(compute_roughness(layer["w"], layer["idx"]))
+                for layer in gin.get_layer_params()
+            ]
+            combo = "-".join(classes)
+
+            seen = combo_count.get(combo, 0) + 1
+            combo_count[combo] = seen
+            suffix = "" if seen == 1 else f"_{seen}"
+
+            out_name = f"{stem}_[{combo}]{suffix}.nii.gz"
+            out_path = os.path.join(OUTPUT_DIR, out_name)
+
+            arr_out = x_aug.squeeze(0).squeeze(0).cpu().numpy()  # (D, H, W)
+            save_nifti(arr_out, out_path, OUTPUT_SPACING_MM)
+
+        combo_summary = ", ".join(f"{k}x{v}" for k, v in combo_count.items())
+        print(f"[{i}/{len(paths)}] {stem}: {N_INSTANCES} variants  ({combo_summary})")
+
+    print(f"\nDone. Outputs in {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()

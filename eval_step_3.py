@@ -33,12 +33,12 @@ def generate_data_for_box_plot(df_list):
 
 # Example data loading
 df = pd.read_csv('./test_result_csv/unet_td1.csv')
-df_1 = pd.read_csv('./test_result_csv/bunet_disintangled_causality_paper_wo_kl_w_tversky_trained_with_only_ct.csv')
-df_2 = pd.read_csv('./test_result_csv/bunet_disintangled_causality_paper_wo_kl_wo_ipa_w_tversky_td1.csv')
-df_3 = pd.read_csv('./test_result_csv/td1_roughness_enforced_5_normalised_gin.csv')
+df_1 = pd.read_csv('./test_result_csv/mri_to_ct_cyclegan_no_mri_leakage_crop_192_volmatched_on_basicunet_td1_marissa_data.csv')
+# df_2 = pd.read_csv('./test_result_csv/energy_based_model_KP_data_OECLAD.csv')
+# df_3 = pd.read_csv('./test_result_csv/td1_roughness_enforced_5_normalised_gin.csv')
 # df_4 = pd.read_csv('./test_result_csv/bunet_disintangled_1.25mm.csv')
 
-df_list = [df, df_1, df_2, df_3]#, df_4]
+df_list = [df, df_1 ]#, df_2]#, df_3]#, df_4]
 
 # Generate the data for box plots
 data1, data2 = generate_data_for_box_plot(df_list)
@@ -48,7 +48,7 @@ plt.rcParams.update({'font.size': 16})
 fig, axes = plt.subplots(1, 2, figsize=(18, 8))
 
 # Define colors and labels for box plots
-box_colors = ['gold', 'black', 'green', 'gray']#, 'gray']# 'green', 'gray']# 'gray']# 'green', 'black']
+box_colors = ['gold', 'black']#, 'green']#, 'gray']# 'green', 'gray']# 'gray']# 'green', 'black']
 handles = []
 
 # Common boxplot styling
@@ -78,16 +78,16 @@ for i, group_data in enumerate(data1, start=1):
         if i == 1:
             if j == 1:
                 handles.append(Patch(facecolor='none', edgecolor=box_colors[j - 1], linewidth=2,
-                                     label='Basic Unet'))
+                                     label='Basic Unet (No Aug/No GIN) Trained on COPD-gene CT'))
             if j == 2:
                 handles.append(Patch(facecolor='none', edgecolor=box_colors[j - 1], linewidth=2,
-                                     label='Causality Paper Approach(W/o KL)'))
-            if j == 3:
-                handles.append(Patch(facecolor='none', edgecolor=box_colors[j - 1], linewidth=2,
-                                     label='Vanilla Gin'))
-            if j == 4:
-                handles.append(Patch(facecolor='none', edgecolor=box_colors[j - 1], linewidth=2,
-                                     label='GIN with Roughness Enforced'))
+                                     label='CycleGAN + Same Unet'))
+            # if j == 3:
+            #     handles.append(Patch(facecolor='none', edgecolor=box_colors[j - 1], linewidth=2,
+            #                          label='Test Time Computed Energy Model'))
+            # if j == 4:
+            #     handles.append(Patch(facecolor='none', edgecolor=box_colors[j - 1], linewidth=2,
+                                    #  label='GIN with Roughness Enforced'))
             # if j == 5:
             #     handles.append(Patch(facecolor='none', edgecolor=box_colors[j - 1], linewidth=2,
             #                          label='Basic Unet(Disintangled) Resolution 1.25mm Isotropic'))
@@ -130,6 +130,6 @@ axes[1].grid(True)
 axes[1].legend(handles=handles + extra_handles, loc='upper right')
 
 os.makedirs("./results_plots", exist_ok=True)
-plt.suptitle('Results on Train Dynamics 1(Validation Set)')
+plt.suptitle('Results on Marissa Data Set')
 plt.savefig('./results_plots/temp.png', bbox_inches='tight')
 plt.cla()
